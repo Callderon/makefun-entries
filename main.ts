@@ -1,268 +1,98 @@
-// tiny-stack-vm: faithful interpreter for make.fun's tiny stack ISA
-// (kit ISA.md; vm.mjs rules). Hard rules done right: imul wrapping MUL,
-// unsigned DIVU/MODU/LTU, 5-bit shift counts, PUSH8 sign extension,
-// INT_MIN/-1, remainder sign, distinct trap codes 2-11, stack/call/memory
-// bounds, step/output limits, fall-off-end = trap 9.
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+// Token Radar, model radar-2 (Node 22, standard library only).
+//
+// The program reads the sealed snapshot from /input/snapshot.json (or --input <file|dir>),
+// scores every rankable pre-token protocol with the model in lib/model.ts, writes the ranked
+// board to /output/board.json, writes the dashboard's data beside the page as /output/data.js,
+// copies this repository's dashboard/ and screenshots/ to /output, and writes
+// /output/dossier.json, the summary the judge reads, with the vendored make.fun library.
+//
+// The dashboard is a static page, no framework and no network: dashboard/index.html,
+// dashboard/app.css and dashboard/app.js read /output/data.js, which this program writes from
+// the same board. The run is deterministic: the same snapshot always writes the same bytes,
+// so the grader's two runs agree.
+//
+// Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
+//   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
 
-function run(p: Uint8Array, inp: Uint8Array): { out: Uint8Array; len: number; code: number } {
-  const D = new Int32Array(256);
-  const C = new Int32Array(64);
-  const M = new Int32Array(256);
-  const out = new Uint8Array(65536);
-  const n = p.length;
-  let sp = 0;
-  let csp = 0;
-  let pc = 0;
-  let ip = 0;
-  let olen = 0;
-  let steps = 0;
-  const done = (code: number): { out: Uint8Array; len: number; code: number } => ({ out, len: olen, code });
-  for (;;) {
-    if (steps === 1000000) return done(10);
-    if (pc < 0 || pc >= n) return done(9);
-    const op = p[pc];
-    // Immediate size, pops and pushes per opcode; an unknown byte traps 5
-    // before any immediate is read.
-    let imm = 0;
-    let pops = 0;
-    let push = 0;
-    switch (op) {
-      case 0x00:
-      case 0x34:
-        break;
-      case 0x01:
-        imm = 1;
-        push = 1;
-        break;
-      case 0x02:
-        imm = 4;
-        push = 1;
-        break;
-      case 0x03:
-      case 0x50:
-      case 0x51:
-      case 0x53:
-        pops = 1;
-        break;
-      case 0x04:
-        pops = 1;
-        push = 2;
-        break;
-      case 0x05:
-        pops = 2;
-        push = 2;
-        break;
-      case 0x06:
-        pops = 2;
-        push = 3;
-        break;
-      case 0x07:
-        pops = 3;
-        push = 3;
-        break;
-      case 0x17:
-      case 0x1b:
-      case 0x40:
-        pops = 1;
-        push = 1;
-        break;
-      case 0x30:
-        imm = 2;
-        break;
-      case 0x31:
-      case 0x32:
-        imm = 2;
-        pops = 1;
-        break;
-      case 0x33:
-        imm = 2;
-        break;
-      case 0x41:
-        pops = 2;
-        break;
-      case 0x52:
-        push = 1;
-        break;
-      default:
-        if ((op >= 0x10 && op <= 0x1e) || (op >= 0x20 && op <= 0x22)) {
-          pops = 2;
-          push = 1;
-        } else {
-          return done(5);
-        }
-    }
-    if (pc + imm >= n) return done(9);
-    steps++;
-    if (sp < pops) return done(2);
-    if (sp - pops + push > 256) return done(3);
-    const next = pc + 1 + imm;
-    pc = next;
-    switch (op) {
-      case 0x00:
-        return done(0);
-      case 0x01:
-        D[sp++] = (p[next - 1] << 24) >> 24;
-        break;
-      case 0x02:
-        D[sp++] = p[next - 4] | (p[next - 3] << 8) | (p[next - 2] << 16) | (p[next - 1] << 24);
-        break;
-      case 0x03:
-        sp--;
-        break;
-      case 0x04:
-        D[sp] = D[sp - 1];
-        sp++;
-        break;
-      case 0x05: {
-        const t = D[sp - 1];
-        D[sp - 1] = D[sp - 2];
-        D[sp - 2] = t;
-        break;
-      }
-      case 0x06:
-        D[sp] = D[sp - 2];
-        sp++;
-        break;
-      case 0x07: {
-        const a = D[sp - 3];
-        D[sp - 3] = D[sp - 2];
-        D[sp - 2] = D[sp - 1];
-        D[sp - 1] = a;
-        break;
-      }
-      case 0x17:
-        D[sp - 1] = -D[sp - 1] | 0;
-        break;
-      case 0x1b:
-        D[sp - 1] = ~D[sp - 1];
-        break;
-      case 0x30:
-      case 0x31:
-      case 0x32: {
-        const rel = ((p[next - 2] | (p[next - 1] << 8)) << 16) >> 16;
-        let take = op === 0x30;
-        if (op !== 0x30) {
-          const v = D[--sp];
-          take = op === 0x31 ? v === 0 : v !== 0;
-        }
-        if (take) pc = next + rel;
-        break;
-      }
-      case 0x33:
-        if (csp === 64) return done(7);
-        C[csp++] = next;
-        pc = p[next - 2] | (p[next - 1] << 8);
-        break;
-      case 0x34:
-        if (csp === 0) return done(8);
-        pc = C[--csp];
-        break;
-      case 0x40: {
-        const addr = D[sp - 1];
-        if (addr < 0 || addr >= 256) return done(6);
-        D[sp - 1] = M[addr];
-        break;
-      }
-      case 0x41: {
-        const addr = D[sp - 1];
-        const v = D[sp - 2];
-        if (addr < 0 || addr >= 256) return done(6);
-        sp -= 2;
-        M[addr] = v;
-        break;
-      }
-      case 0x50: {
-        const s = String(D[sp - 1]);
-        if (olen + s.length > 65536) return done(11);
-        sp--;
-        for (let i = 0; i < s.length; i++) out[olen++] = s.charCodeAt(i);
-        break;
-      }
-      case 0x51:
-        if (olen + 1 > 65536) return done(11);
-        out[olen++] = D[--sp] & 255;
-        break;
-      case 0x52:
-        D[sp++] = ip < inp.length ? inp[ip++] : -1;
-        break;
-      case 0x53:
-        return done(D[--sp] & 255);
-      default: {
-        // Binary operators 0x10-0x1e and 0x20-0x22 (0x17/0x1b handled above).
-        const b = D[sp - 1];
-        const a = D[sp - 2];
-        let r: number;
-        switch (op) {
-          case 0x10:
-            r = (a + b) | 0;
-            break;
-          case 0x11:
-            r = (a - b) | 0;
-            break;
-          case 0x12:
-            r = Math.imul(a, b);
-            break;
-          case 0x13:
-            if (b === 0) return done(4);
-            r = a === -2147483648 && b === -1 ? a : Math.trunc(a / b) | 0;
-            break;
-          case 0x14:
-            if (b === 0) return done(4);
-            r = b === -1 ? 0 : a % b | 0;
-            break;
-          case 0x15:
-            if (b === 0) return done(4);
-            r = Math.floor((a >>> 0) / (b >>> 0)) | 0;
-            break;
-          case 0x16:
-            if (b === 0) return done(4);
-            r = (a >>> 0) % (b >>> 0) | 0;
-            break;
-          case 0x18:
-            r = a & b;
-            break;
-          case 0x19:
-            r = a | b;
-            break;
-          case 0x1a:
-            r = a ^ b;
-            break;
-          case 0x1c:
-            r = a << (b & 31);
-            break;
-          case 0x1d:
-            r = a >> (b & 31);
-            break;
-          case 0x1e:
-            r = (a >>> (b & 31)) | 0;
-            break;
-          case 0x20:
-            r = a === b ? 1 : 0;
-            break;
-          case 0x21:
-            r = a < b ? 1 : 0;
-            break;
-          default:
-            r = (a >>> 0) < (b >>> 0) ? 1 : 0;
-        }
-        D[sp - 2] = r;
-        sp--;
-        break;
-      }
-    }
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { boardIssue, buildRadar, dataScript, parseSnapshot } from './lib/model.ts';
+import { buildDossier } from './vendor/makefun-board.ts';
+
+const here = fileURLToPath(new URL('.', import.meta.url));
+
+/** The scorer's own caps (reference/gate.json): the text cap shapes the bytes, the rest refuse. */
+const TEXT_MAX_BYTES = 65_536;
+const SCREENSHOT_CAPS = { max: 4, max_bytes: 524_288 };
+const IMAGE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$/;
+
+/** --name <value> out of the arguments, or the fallback. */
+function arg(name: string, fallback: string): string {
+  const at = process.argv.indexOf(`--${name}`);
+  if (at >= 0 && at + 1 < process.argv.length) return process.argv[at + 1]!;
+  const withEquals = process.argv.find((a) => a.startsWith(`--${name}=`));
+  return withEquals === undefined ? fallback : withEquals.slice(name.length + 3);
+}
+
+const inputArg = arg('input', '/input');
+const inputFile = inputArg.endsWith('.json') ? inputArg : join(inputArg, 'snapshot.json');
+if (!existsSync(inputFile)) {
+  process.stderr.write(`token radar: no snapshot at ${inputFile}: pass --input <snapshot.json|directory> or mount the sealed /input\n`);
+  process.exit(2);
+}
+const out = arg('output', process.env.MAKEFUN_OUTPUT_DIR ?? '/output');
+
+const snapshot = parseSnapshot(readFileSync(inputFile, 'utf8'));
+const { board, radar } = buildRadar(snapshot);
+const issue = boardIssue(board, snapshot);
+if (issue !== null) {
+  process.stderr.write(`token radar: the model wrote a board the gate refuses: ${issue}\n`);
+  process.exit(1);
+}
+
+mkdirSync(out, { recursive: true });
+writeFileSync(join(out, 'board.json'), `${JSON.stringify({ rows: board })}\n`);
+writeFileSync(join(out, 'data.js'), dataScript(radar));
+
+/** Copy one directory's regular files into `to`, skipping names that start with a dot. */
+function copyFiles(from: string, to: string): string[] {
+  if (!existsSync(from)) return [];
+  mkdirSync(to, { recursive: true });
+  const copied: string[] = [];
+  for (const name of readdirSync(from)) {
+    if (name.startsWith('.')) continue;
+    const path = join(from, name);
+    if (!statSync(path).isFile()) continue;
+    copyFileSync(path, join(to, name));
+    copied.push(name);
+  }
+  return copied;
+}
+
+const dashboardFiles = copyFiles(join(here, 'dashboard'), join(out, 'dashboard'));
+if (dashboardFiles.length < 3 || !dashboardFiles.includes('index.html')) {
+  process.stderr.write(`token radar: dashboard/ holds ${dashboardFiles.length} files: hand in index.html with its .css and .js\n`);
+  process.exit(1);
+}
+const shots = copyFiles(join(here, 'screenshots'), join(out, 'screenshots'));
+if (shots.length < 3) {
+  process.stderr.write(`token radar: screenshots/ holds ${shots.length} image${shots.length === 1 ? '' : 's'}: hand in 3, the board, a detail view and a filtered view\n`);
+  process.exit(1);
+}
+for (const name of shots) {
+  if (!IMAGE_NAME.test(name)) {
+    process.stderr.write(`token radar: screenshots/${name}: a name is letters, digits and . _ -, 1 to 128 characters\n`);
+    process.exit(1);
   }
 }
 
-const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-for (const id of readdirSync(I).sort()) {
-  const r = run(
-    new Uint8Array(readFileSync(join(I, id, 'program.bin'))),
-    new Uint8Array(readFileSync(join(I, id, 'input.bin'))),
-  );
-  mkdirSync(join(O, id), { recursive: true });
-  writeFileSync(join(O, id, 'stdout.bin'), r.out.subarray(0, r.len));
-  writeFileSync(join(O, id, 'exit.txt'), `${r.code}\n`);
-}
+// The dossier is written last: the scorer rebuilds it from this /output and compares bytes.
+const dossier = buildDossier(out, { text_max_bytes: TEXT_MAX_BYTES, screenshots: SCREENSHOT_CAPS, dashboard: { max_files: 400, max_bytes: 4_194_304 } });
+writeFileSync(join(out, 'dossier.json'), dossier);
+
+process.stdout.write(
+  `token radar: ${snapshot.protocols.length} protocols, ${snapshot.watchlist.length} on the watchlist, ${board.length} rows scored (${radar.excluded_pre_token} pre-token protocols set aside)\n` +
+    `token radar: top implied value $${board[0]!.implied_value_usd.toLocaleString('en-US')} (${board[0]!.slug}), board $${board[board.length - 1]!.implied_value_usd.toLocaleString('en-US')} at rank ${board.length}\n` +
+    `token radar: wrote ${join(out, 'board.json')}, ${join(out, 'data.js')}, ${join(out, 'dashboard')} (${dashboardFiles.length} files), ${join(out, 'screenshots')} (${shots.length} images) and ${join(out, 'dossier.json')}\n`,
+);
